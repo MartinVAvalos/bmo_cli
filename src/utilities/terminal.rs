@@ -1,0 +1,67 @@
+use std::path::{Path, PathBuf};
+
+use dialoguer::{theme::ColorfulTheme, MultiSelect, Select};
+
+use crate::utilities::file_tools;
+
+/// What the user wants the tool to print.
+pub enum Mode {
+    Structure,
+    Contents,
+    Both,
+}
+
+/// Ask which kind of output to produce.
+pub fn select_mode() -> Mode {
+    let options = ["File structure", "File names + contents", "Both"];
+
+    let index = Select::with_theme(&ColorfulTheme::default())
+        .with_prompt("What should I output?")
+        .items(&options)
+        .default(0)
+        .interact()
+        .unwrap();
+
+    match index {
+        0 => Mode::Structure,
+        1 => Mode::Contents,
+        _ => Mode::Both,
+    }
+}
+
+/// Show the whole tree (folders + files, indented) and let the user tick the
+/// items they want. Ticking a folder pulls in everything inside it, so you can
+/// grab a whole directory with one keystroke or drill in and pick single files.
+pub fn select_paths(base: &Path) -> Vec<PathBuf> {
+    let entries = file_tools::walk_tree(base);
+
+    if entries.is_empty() {
+        eprintln!("No files found under {}", base.display());
+        return Vec::new();
+    }
+
+    let labels: Vec<String> = entries
+        .iter()
+        .map(|entry| {
+            let indent = "  ".repeat(entry.depth);
+            let name = entry
+                .path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+            if entry.is_dir {
+                format!("{}{}/", indent, name)
+            } else {
+                format!("{}{}", indent, name)
+            }
+        })
+        .collect();
+
+    let chosen = MultiSelect::with_theme(&ColorfulTheme::default())
+        .with_prompt("Select files/folders (space toggles, enter confirms)")
+        .items(&labels)
+        .interact()
+        .unwrap();
+
+    chosen.into_iter().map(|i| entries[i].path.clone()).collect()
+}
