@@ -38,16 +38,25 @@ fn walk(dir: &Path, depth: usize, out: &mut Vec<Entry>) {
         Err(_) => return,
     };
 
-    let mut paths: Vec<PathBuf> = read.filter_map(|e| e.ok()).map(|e| e.path()).collect();
+    // Collect (path, is_dir) using the entry's own file type, which does NOT
+    // follow symlinks. Skipping symlinks means a cyclic link (a folder linking
+    // back up its own tree) can't send the walk into an infinite loop.
+    let mut items: Vec<(PathBuf, bool)> = Vec::new();
+    for entry in read.filter_map(|e| e.ok()) {
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(_) => continue,
+        };
+        if file_type.is_symlink() {
+            continue;
+        }
+        items.push((entry.path(), file_type.is_dir()));
+    }
 
     // Folders first, then files; alphabetical within each group.
-    paths.sort_by(|a, b| {
-        b.is_dir()
-            .cmp(&a.is_dir())
-            .then(a.file_name().cmp(&b.file_name()))
-    });
+    items.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.file_name().cmp(&b.0.file_name())));
 
-    for path in paths {
+    for (path, is_dir) in items {
         let name = path
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
@@ -57,7 +66,6 @@ fn walk(dir: &Path, depth: usize, out: &mut Vec<Entry>) {
             continue;
         }
 
-        let is_dir = path.is_dir();
         out.push(Entry {
             path: path.clone(),
             depth,
@@ -70,45 +78,31 @@ fn walk(dir: &Path, depth: usize, out: &mut Vec<Entry>) {
     }
 }
 
-/// Expand the user's selection into a flat, sorted, de-duplicated list of files.
-/// A selected folder contributes every file inside it; a selected file is kept.
+/// The files to output: every checked path that is a file. We deliberately do
+/// NOT walk directories here — the picker's cascade already checks each file
+/// under a chosen folder, so a file you explicitly unchecked stays excluded
+/// even when its parent folder is still selected.
 fn collect_files(selected: &[PathBuf]) -> Vec<PathBuf> {
-    let mut files = Vec::new();
-
-    for path in selected {
-        if path.is_dir() {
-            for entry in walk_tree(path) {
-                if !entry.is_dir {
-                    files.push(entry.path);
-                }
-            }
-        } else if path.is_file() {
-            files.push(path.clone());
-        }
-    }
+    let mut files: Vec<PathBuf> = selected
+        .iter()
+        .filter(|path| path.is_file())
+        .cloned()
+        .collect();
 
     files.sort();
     files.dedup();
     files
 }
 
-/// Mode 1: a nested-brace view of everything in the selection. Folders are
-/// rendered as `name { ... }`, empty folders as `name {}`, and files as bare
-/// names. Siblings are comma-separated, one per line, indented by depth.
+/// Mode 1: a nested-brace view of the selection. Folders are rendered as
+/// `name { ... }`, empty (but checked) folders as `name {}`, and files as bare
+/// names. Built from the explicit checked paths so it matches the file output;
+/// ancestor folders of a checked file are created automatically.
 pub fn build_structure(base: &Path, selected: &[PathBuf]) -> String {
     let mut root = TreeNode::default();
 
     for path in selected {
-        if path.is_dir() {
-            // The selected folder itself, plus everything inside it
-            // (including empty subfolders, which `walk_tree` still reports).
-            insert_path(&mut root, base, path, true);
-            for entry in walk_tree(path) {
-                insert_path(&mut root, base, &entry.path, entry.is_dir);
-            }
-        } else if path.is_file() {
-            insert_path(&mut root, base, path, false);
-        }
+        insert_path(&mut root, base, path, path.is_dir());
     }
 
     let mut out = String::from("{\n");

@@ -1,9 +1,15 @@
 [package]
-name = "bmo"
+name = "bmo_cli"
 version = "0.1.0"
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
+# The installed command is named `bmo` (the package is still `bmo_cli`).
+[[bin]]
+name = "bmo"
+path = "src/main.rs"
+
 [dependencies]
+console = "0.15.5"
 dialoguer = "0.10.3"

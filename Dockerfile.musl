@@ -1,0 +1,22 @@
+# Builds a fully static (musl) Linux binary so it runs on any Linux distro
+# regardless of glibc version. Used by `make docker-extract`, which copies the
+# binary out of the image onto your machine — no Rust, no Docker at runtime.
+FROM rust:1-bookworm AS builder
+
+# Native musl target for the build host's architecture (x86_64 or aarch64),
+# passed in by the Makefile via uname -m.
+ARG TARGET=x86_64-unknown-linux-musl
+
+RUN rustup target add ${TARGET} \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends musl-tools \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+COPY Cargo.toml Cargo.lock ./
+COPY src ./src
+
+# Build with the pinned dependency versions, then stash the binary at a fixed
+# path so `docker cp` can grab it.
+RUN cargo build --release --locked --target ${TARGET} \
+    && cp target/${TARGET}/release/bmo /bmo
