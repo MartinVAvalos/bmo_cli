@@ -15,7 +15,114 @@ const IGNORED: &[&str] = &[
     ".idea",
     ".vscode",
     ".gitignore",
+    ".env", // plain environment file – likely contains secrets
 ];
+
+/// Name prefixes that are always excluded (e.g. `.env.local`, `.env.production`).
+const IGNORED_PREFIXES: &[&str] = &[".env."];
+
+/// Returns true if `path` should never appear in export output regardless of
+/// how it entered the selection (interactive picker, `-clip`, or `-last`).
+///
+/// Checks every component of the path relative to `base` so that files nested
+/// inside an ignored directory (e.g. `target/release/bmo`) are caught even
+/// when they arrive as absolute paths via `-clip`.
+fn is_excluded_from_export(base: &Path, path: &Path, gitignore: &[String]) -> bool {
+    let rel = path.strip_prefix(base).unwrap_or(path);
+
+    for component in rel.components() {
+        let name = component.as_os_str().to_string_lossy();
+        let n: &str = &name;
+        if IGNORED.contains(&n) || IGNORED_PREFIXES.iter().any(|p| n.starts_with(p)) {
+            return true;
+        }
+    }
+
+    // Catch env files by extension: `vm_back.env`, `example.env`, etc.
+    if path.extension().is_some_and(|e| e == "env") {
+        return true;
+    }
+
+    matches_gitignore(base, path, gitignore)
+}
+
+/// Read patterns from `<base>/.gitignore`. Blank lines, comments (`#`), and
+/// negations (`!`) are dropped; a leading `/` is stripped so patterns remain
+/// relative to the project root.
+fn load_gitignore(base: &Path) -> Vec<String> {
+    match fs::read_to_string(base.join(".gitignore")) {
+        Ok(content) => content
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with('#') && !l.starts_with('!'))
+            .map(|l| l.trim_start_matches('/').trim_end_matches('/').to_owned())
+            .collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Returns true if `path` matches any of the supplied gitignore `patterns`.
+///
+/// Supports:
+/// - **Plain names** (`target`, `.env`): match against the filename *or* any
+///   component of the relative path.
+/// - **Filename globs** (`*.env`, `*.log`): `*` matches zero or more
+///   characters within a single filename component.
+/// - **Path-relative patterns** (`config/secrets.json`): matched against the
+///   full path relative to `base`.
+fn matches_gitignore(base: &Path, path: &Path, patterns: &[String]) -> bool {
+    let rel = match path.strip_prefix(base) {
+        Ok(r) => r,
+        Err(_) => return false,
+    };
+    let rel_fwd: String = rel
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .collect::<Vec<_>>()
+        .join("/");
+    let file_name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+
+    for pattern in patterns {
+        if pattern.contains('/') {
+            // Path-relative: match against the forward-slash relative path.
+            if rel_fwd == *pattern || rel_fwd.starts_with(&format!("{}/", pattern)) {
+                return true;
+            }
+        } else if pattern.contains('*') {
+            // Filename glob: only applied to the filename component.
+            if glob_filename_match(pattern, &file_name) {
+                return true;
+            }
+        } else {
+            // Plain name: match the filename or any component in the path.
+            if file_name == *pattern
+                || rel
+                    .components()
+                    .any(|c| c.as_os_str() == pattern.as_str())
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Single-level glob using `*` as the only wildcard character (no `**`, no `?`).
+/// `prefix*suffix` style patterns with multiple `*` are not supported and
+/// return false.
+fn glob_filename_match(pattern: &str, name: &str) -> bool {
+    match pattern.split_once('*') {
+        Some((prefix, suffix)) => {
+            name.starts_with(prefix)
+                && name.ends_with(suffix)
+                && name.len() >= prefix.len() + suffix.len()
+        }
+        None => pattern == name,
+    }
+}
 
 /// One node from a directory walk: where it is, how deep, and whether it's a folder.
 pub struct Entry {
@@ -62,7 +169,9 @@ fn walk(dir: &Path, depth: usize, out: &mut Vec<Entry>) {
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_default();
 
-        if IGNORED.contains(&name.as_str()) {
+        if IGNORED.contains(&name.as_str())
+            || IGNORED_PREFIXES.iter().any(|p| name.starts_with(p))
+        {
             continue;
         }
 
@@ -78,14 +187,14 @@ fn walk(dir: &Path, depth: usize, out: &mut Vec<Entry>) {
     }
 }
 
-/// The files to output: every checked path that is a file. We deliberately do
-/// NOT walk directories here — the picker's cascade already checks each file
-/// under a chosen folder, so a file you explicitly unchecked stays excluded
-/// even when its parent folder is still selected.
-fn collect_files(selected: &[PathBuf]) -> Vec<PathBuf> {
+/// The files to output: every checked path that is a real file and is not
+/// excluded by the shared export rules (IGNORED names, `.env` extension,
+/// `.gitignore` patterns).
+fn collect_files(base: &Path, selected: &[PathBuf]) -> Vec<PathBuf> {
+    let gitignore = load_gitignore(base);
     let mut files: Vec<PathBuf> = selected
         .iter()
-        .filter(|path| path.is_file())
+        .filter(|path| path.is_file() && !is_excluded_from_export(base, path, &gitignore))
         .cloned()
         .collect();
 
@@ -94,14 +203,16 @@ fn collect_files(selected: &[PathBuf]) -> Vec<PathBuf> {
     files
 }
 
-/// Mode 1: a nested-brace view of the selection. Folders are rendered as
-/// `name { ... }`, empty (but checked) folders as `name {}`, and files as bare
-/// names. Built from the explicit checked paths so it matches the file output;
-/// ancestor folders of a checked file are created automatically.
+/// Mode 1: a nested-brace view of the selection. Applies the same exclusion
+/// rules as `build_contents` so the two outputs stay in sync.
 pub fn build_structure(base: &Path, selected: &[PathBuf]) -> String {
+    let gitignore = load_gitignore(base);
     let mut root = TreeNode::default();
 
     for path in selected {
+        if is_excluded_from_export(base, path, &gitignore) {
+            continue;
+        }
         insert_path(&mut root, base, path, path.is_dir());
     }
 
@@ -123,7 +234,7 @@ fn insert_path(root: &mut TreeNode, base: &Path, path: &Path, is_dir: bool) {
 
 /// Mode 2: each file's relative path followed by its contents in a code fence.
 pub fn build_contents(base: &Path, selected: &[PathBuf]) -> String {
-    let files = collect_files(selected);
+    let files = collect_files(base, selected);
     let mut out = String::new();
 
     for file in &files {
@@ -269,5 +380,191 @@ impl TreeNode {
                 out.push_str(&format!("{}{}{}\n", indent, name, comma));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::env::temp_dir;
+
+    fn make_temp_file(base: &Path, rel: &str) {
+        let full = base.join(rel);
+        fs::create_dir_all(full.parent().unwrap()).unwrap();
+        fs::write(&full, b"").unwrap();
+    }
+
+    // ---------------------------------------------------------------------------
+    // glob_filename_match
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn glob_matches_suffix_wildcard() {
+        assert!(glob_filename_match("*.env", "vm_back.env"));
+        assert!(glob_filename_match("*.env", "example.env"));
+        assert!(glob_filename_match("*.log", "app.log"));
+        assert!(!glob_filename_match("*.env", "dotenv"));
+        assert!(!glob_filename_match("*.env", ".env.local"));
+    }
+
+    #[test]
+    fn glob_matches_prefix_wildcard() {
+        assert!(glob_filename_match(".env*", ".env.local"));
+        assert!(glob_filename_match(".env*", ".env.production"));
+        assert!(!glob_filename_match(".env*", "vm_back.env"));
+    }
+
+    #[test]
+    fn glob_exact_without_wildcard() {
+        assert!(glob_filename_match(".env", ".env"));
+        assert!(!glob_filename_match(".env", "dotenv"));
+    }
+
+    // ---------------------------------------------------------------------------
+    // matches_gitignore
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn gitignore_plain_name_matches_any_component() {
+        let base = temp_dir().join("bmo_gi_plain");
+        let path = base.join("src/secrets/config.rs");
+        assert!(matches_gitignore(&base, &path, &["secrets".to_owned()]));
+        assert!(!matches_gitignore(&base, &path, &["other".to_owned()]));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn gitignore_plain_name_matches_filename() {
+        let base = temp_dir().join("bmo_gi_fname");
+        let path = base.join(".env");
+        assert!(matches_gitignore(&base, &path, &[".env".to_owned()]));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn gitignore_glob_matches_extension() {
+        let base = temp_dir().join("bmo_gi_glob");
+        let vm = base.join("vm_back.env");
+        let ex = base.join("example.env");
+        let src = base.join("src/main.rs");
+        let patterns = vec!["*.env".to_owned()];
+        assert!(matches_gitignore(&base, &vm, &patterns));
+        assert!(matches_gitignore(&base, &ex, &patterns));
+        assert!(!matches_gitignore(&base, &src, &patterns));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn gitignore_path_pattern_matches_relative() {
+        let base = temp_dir().join("bmo_gi_path");
+        let path = base.join("config/secrets.json");
+        assert!(matches_gitignore(
+            &base,
+            &path,
+            &["config/secrets.json".to_owned()]
+        ));
+        assert!(!matches_gitignore(
+            &base,
+            &path,
+            &["other/secrets.json".to_owned()]
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // ---------------------------------------------------------------------------
+    // is_excluded_from_export
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn excludes_env_by_name() {
+        let base = temp_dir().join("bmo_excl_name");
+        assert!(is_excluded_from_export(&base, &base.join(".env"), &[]));
+        assert!(is_excluded_from_export(
+            &base,
+            &base.join(".env.local"),
+            &[]
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn excludes_env_by_extension() {
+        let base = temp_dir().join("bmo_excl_ext");
+        assert!(is_excluded_from_export(
+            &base,
+            &base.join("vm_back.env"),
+            &[]
+        ));
+        assert!(is_excluded_from_export(
+            &base,
+            &base.join("example.env"),
+            &[]
+        ));
+        assert!(!is_excluded_from_export(
+            &base,
+            &base.join("src/main.rs"),
+            &[]
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn excludes_files_nested_inside_ignored_dir() {
+        let base = temp_dir().join("bmo_excl_nested");
+        // A file inside target/ should be excluded even as an absolute path
+        let nested = base.join("target/release/bmo");
+        assert!(is_excluded_from_export(&base, &nested, &[]));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn excludes_via_gitignore_pattern() {
+        let base = temp_dir().join("bmo_excl_gi");
+        let secret = base.join("db_password.env");
+        let patterns = vec!["*.env".to_owned()];
+        assert!(is_excluded_from_export(&base, &secret, &patterns));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // ---------------------------------------------------------------------------
+    // collect_files / build_contents  (export-stage guard)
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn collect_files_excludes_env_files() {
+        let base = temp_dir().join("bmo_collect_env");
+        make_temp_file(&base, "src/main.rs");
+        make_temp_file(&base, ".env");
+        make_temp_file(&base, ".env.local");
+        make_temp_file(&base, "vm_back.env");
+
+        let selected = vec![
+            base.join("src/main.rs"),
+            base.join(".env"),
+            base.join(".env.local"),
+            base.join("vm_back.env"),
+        ];
+        let files = collect_files(&base, &selected);
+
+        assert_eq!(files.len(), 1);
+        assert!(files[0].ends_with("main.rs"));
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn collect_files_respects_gitignore() {
+        let base = temp_dir().join("bmo_collect_gi");
+        make_temp_file(&base, "src/main.rs");
+        make_temp_file(&base, "secrets/key.txt");
+        fs::write(base.join(".gitignore"), "secrets/\n").unwrap();
+
+        let selected = vec![base.join("src/main.rs"), base.join("secrets/key.txt")];
+        let files = collect_files(&base, &selected);
+
+        assert_eq!(files.len(), 1);
+        assert!(files[0].ends_with("main.rs"));
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

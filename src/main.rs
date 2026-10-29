@@ -207,9 +207,10 @@ fn clipboard_debug() {
         let strategy = strategies.get(i).copied().unwrap_or("unknown");
         let files = clipboard::extract_clipboard_paths(&base, text);
 
-        // Show a short escaped preview (first 80 chars)
-        let preview = if text.len() > 80 {
-            format!("{:?}...", &text[..80])
+        // Show a short escaped preview (first 80 chars, not bytes)
+        let preview = if text.chars().count() > 80 {
+            let truncated: String = text.chars().take(80).collect();
+            format!("{:?}...", truncated)
         } else {
             format!("{:?}", text)
         };

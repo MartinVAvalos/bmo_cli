@@ -1,9 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-#[cfg(test)]
-use std::env;
-
 /// Read text from the system clipboard.
 /// Returns None if no clipboard reader is available.
 /// Prefer `read_clipboard_candidates()` for better multi-representation support.
@@ -63,6 +60,27 @@ pub fn read_from_clipboard() -> Option<String> {
     None
 }
 
+/// Try each `(command, args)` pair in order; return the first result that
+/// exits successfully with non-empty output. Returns `None` when every command
+/// is missing, fails, or produces empty output.
+///
+/// This is the production fallback function used by the Linux path of
+/// `read_clipboard_candidates`; extracting it here makes the skip-to-next
+/// behaviour testable with real OS commands.
+fn first_successful_reader(commands: &[(&str, &[&str])]) -> Option<String> {
+    for &(cmd, args) in commands {
+        if let Ok(out) = Command::new(cmd).args(args).output() {
+            if out.status.success() {
+                let text = String::from_utf8_lossy(&out.stdout).to_string();
+                if !text.is_empty() {
+                    return Some(text);
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Read multiple possible clipboard representations.
 /// On macOS, tries different clipboard flavors and returns all successful ones.
 /// On other platforms, returns at most one representation.
@@ -115,26 +133,13 @@ pub fn read_clipboard_candidates() -> Vec<String> {
             }
         }
     } else {
-        // Linux: try multiple clipboard readers in order
-        for cmd in &["wl-paste", "xclip", "xsel"] {
-            let output = match *cmd {
-                "wl-paste" => Command::new(cmd).output(),
-                "xclip" => Command::new(cmd)
-                    .args(["-selection", "clipboard", "-o"])
-                    .output(),
-                "xsel" => Command::new(cmd).args(["--clipboard", "--output"]).output(),
-                _ => continue,
-            };
-
-            if let Ok(out) = output {
-                if out.status.success() {
-                    let text = String::from_utf8_lossy(&out.stdout).to_string();
-                    if !text.is_empty() {
-                        candidates.push(text);
-                        break; // Use first successful Linux reader
-                    }
-                }
-            }
+        // Linux: try multiple clipboard readers in order; stop at the first that works.
+        if let Some(text) = first_successful_reader(&[
+            ("wl-paste", &[]),
+            ("xclip", &["-selection", "clipboard", "-o"]),
+            ("xsel", &["--clipboard", "--output"]),
+        ]) {
+            candidates.push(text);
         }
     }
 
@@ -307,25 +312,25 @@ fn validate_candidates(base: &Path, candidates: Vec<String>) -> Vec<PathBuf> {
     valid
 }
 
-/// Helper function to simulate clipboard reader fallback.
-/// Used for testing that failure of one candidate doesn't prevent trying the next.
-#[cfg(test)]
-fn try_clipboard_readers_sequence<F>(readers: &[&str], mut executor: F) -> Option<String>
-where
-    F: FnMut(&str) -> Result<String, String>,
-{
-    for reader in readers {
-        match executor(reader) {
-            Ok(content) => return Some(content),
-            Err(_) => continue,
-        }
-    }
-    None
-}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---------------------------------------------------------------------------
+    // Helpers
+    // ---------------------------------------------------------------------------
+
+    /// Create a file at `base/rel_path`, creating parent directories as needed.
+    fn make_temp_file(base: &std::path::Path, rel_path: &str) {
+        let full = base.join(rel_path);
+        std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+        std::fs::write(&full, b"").unwrap();
+    }
+
+    // ---------------------------------------------------------------------------
+    // is_diff_metadata
+    // ---------------------------------------------------------------------------
 
     #[test]
     fn is_diff_metadata_recognizes_patch_stats() {
@@ -345,6 +350,10 @@ mod tests {
         assert!(!is_diff_metadata("terminal.rs"));
         assert!(!is_diff_metadata(""));
     }
+
+    // ---------------------------------------------------------------------------
+    // extract_copilot_breadcrumb
+    // ---------------------------------------------------------------------------
 
     #[test]
     fn extract_copilot_breadcrumb_formats_correctly() {
@@ -369,13 +378,16 @@ mod tests {
 
     #[test]
     fn extract_copilot_breadcrumb_with_diff_stats() {
-        // Test that breadcrumbs with leading diff stats (+106-33) work
         let result = extract_copilot_breadcrumb("+106-33`clipboard.rs`src/utilities");
         assert_eq!(result, Some("src/utilities/clipboard.rs".to_string()));
 
         let result = extract_copilot_breadcrumb("+7-3`main.rs`src");
         assert_eq!(result, Some("src/main.rs".to_string()));
     }
+
+    // ---------------------------------------------------------------------------
+    // extract_backtick_path
+    // ---------------------------------------------------------------------------
 
     #[test]
     fn extract_backtick_path_full_path() {
@@ -389,6 +401,10 @@ mod tests {
         assert_eq!(result, None);
     }
 
+    // ---------------------------------------------------------------------------
+    // validate_candidates
+    // ---------------------------------------------------------------------------
+
     #[test]
     fn validate_candidates_filters_nonexistent() {
         let base = PathBuf::from(".");
@@ -399,10 +415,9 @@ mod tests {
 
     #[test]
     fn validate_candidates_deduplicates() {
-        let base = env::temp_dir();
-        // Create a real temp file for testing
+        let base = std::env::temp_dir();
         let test_file = base.join("test_bmo_dedup.txt");
-        let _ = std::fs::write(&test_file, "test");
+        std::fs::write(&test_file, b"test").unwrap();
 
         let candidates = vec![
             format!("{}/test_bmo_dedup.txt", base.display()),
@@ -416,15 +431,34 @@ mod tests {
     }
 
     #[test]
+    fn validate_candidates_rejects_directories() {
+        let base = std::env::temp_dir().join("bmo_test_rejects_dirs");
+        std::fs::create_dir_all(&base).unwrap();
+        let subdir = base.join("a_subdir");
+        std::fs::create_dir_all(&subdir).unwrap();
+
+        let candidates = vec!["a_subdir".to_string()];
+        let result = validate_candidates(&base, candidates);
+        assert!(result.is_empty(), "Directories should not be accepted as candidates");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // ---------------------------------------------------------------------------
+    // extract_clipboard_paths — explicit temp fixtures
+    // ---------------------------------------------------------------------------
+
+    #[test]
     fn extract_clipboard_paths_with_copilot_sample() {
-        // This test uses a real file that exists in the project
-        let base = PathBuf::from(".");
-        if base.join("src/utilities/terminal.rs").exists() {
-            let clipboard = "+13-2\n\n`terminal.rs`src/utilities\n\n+13\n\n-2\n\n-";
-            let result = extract_clipboard_paths(&base, clipboard);
-            assert!(!result.is_empty());
-            assert!(result[0].ends_with("terminal.rs"));
-        }
+        let base = std::env::temp_dir().join("bmo_test_copilot_sample");
+        make_temp_file(&base, "src/utilities/terminal.rs");
+
+        let clipboard = "+13-2\n\n`terminal.rs`src/utilities\n\n+13\n\n-2\n\n-";
+        let result = extract_clipboard_paths(&base, clipboard);
+        assert!(!result.is_empty());
+        assert!(result[0].ends_with("terminal.rs"));
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
@@ -437,83 +471,37 @@ mod tests {
 
     #[test]
     fn extract_clipboard_paths_handles_normal_path() {
-        let base = PathBuf::from(".");
-        if base.join("src/utilities/terminal.rs").exists() {
-            let clipboard = "src/utilities/terminal.rs";
-            let result = extract_clipboard_paths(&base, clipboard);
-            assert!(!result.is_empty());
-            assert!(result[0].ends_with("terminal.rs"));
-        }
+        let base = std::env::temp_dir().join("bmo_test_normal_path");
+        make_temp_file(&base, "src/utilities/terminal.rs");
+
+        let clipboard = "src/utilities/terminal.rs";
+        let result = extract_clipboard_paths(&base, clipboard);
+        assert!(!result.is_empty());
+        assert!(result[0].ends_with("terminal.rs"));
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
     fn extract_clipboard_paths_handles_windows_separators() {
-        let base = PathBuf::from(".");
-        if base.join("src/utilities/terminal.rs").exists() {
-            let clipboard = "src\\utilities\\terminal.rs";
-            let result = extract_clipboard_paths(&base, clipboard);
-            assert!(!result.is_empty());
-            assert!(result[0].ends_with("terminal.rs"));
-        }
-    }
+        let base = std::env::temp_dir().join("bmo_test_win_sep");
+        make_temp_file(&base, "src/utilities/terminal.rs");
 
-    #[test]
-    fn validate_candidates_rejects_directories() {
-        let base = PathBuf::from(".");
-        // "src" is a directory in the project
-        if base.join("src").is_dir() {
-            let candidates = vec!["src".to_string()];
-            let result = validate_candidates(&base, candidates);
-            // Directory should be rejected; result should be empty
-            assert!(
-                result.is_empty(),
-                "Directories should not be accepted as candidates"
-            );
-        }
-    }
+        let clipboard = "src\\utilities\\terminal.rs";
+        let result = extract_clipboard_paths(&base, clipboard);
+        assert!(!result.is_empty());
+        assert!(result[0].ends_with("terminal.rs"));
 
-    #[test]
-    fn clipboard_reader_fallback_tries_all_candidates() {
-        // Test that the fallback logic continues even if early candidates fail
-        let readers = vec!["first", "second", "third"];
-        let mut attempt_count = 0;
-
-        let result = try_clipboard_readers_sequence(&readers, |cmd| {
-            attempt_count += 1;
-            match cmd {
-                "first" | "second" => Err("not available".to_string()),
-                "third" => Ok("success from third".to_string()),
-                _ => Err("unknown".to_string()),
-            }
-        });
-
-        // Should have tried all three and gotten the result from the third
-        assert_eq!(result, Some("success from third".to_string()));
-        assert_eq!(attempt_count, 3, "Should have tried all three readers");
-    }
-
-    #[test]
-    fn clipboard_reader_fallback_returns_none_if_all_fail() {
-        // Test that None is returned when all candidates fail
-        let readers = vec!["first", "second"];
-        let mut attempt_count = 0;
-
-        let result = try_clipboard_readers_sequence(&readers, |_cmd| {
-            attempt_count += 1;
-            Err("not available".to_string())
-        });
-
-        // Should have tried all and gotten None
-        assert_eq!(result, None);
-        assert_eq!(attempt_count, 2, "Should have tried all readers");
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
     fn extract_clipboard_paths_mixed_copilot_breadcrumbs_and_ui_noise() {
-        // Regression test: Multiple valid Copilot breadcrumbs with diff stats and UI noise
-        let base = PathBuf::from(".");
-        if base.join("src/utilities/clipboard.rs").exists() && base.join("src/main.rs").exists() {
-            let clipboard = r#"+106-33`clipboard.rs`src/utilities
+        let base = std::env::temp_dir().join("bmo_test_mixed_noise");
+        make_temp_file(&base, "src/utilities/clipboard.rs");
+        make_temp_file(&base, "src/main.rs");
+
+        let clipboard = r#"+106-33`clipboard.rs`src/utilities
 +99
 -30
 
@@ -525,157 +513,155 @@ mod tests {
 .monaco-list.list_id_11 .monaco-list-row.selected { color: white; }
 
 -"#;
-            let result = extract_clipboard_paths(&base, clipboard);
+        let result = extract_clipboard_paths(&base, clipboard);
+        assert_eq!(result.len(), 2, "Should find exactly 2 valid files");
 
-            // Should extract exactly 2 files, in encounter order
-            assert_eq!(result.len(), 2, "Should find exactly 2 valid files");
+        let rel1 = result[0].strip_prefix(&base).unwrap();
+        let rel2 = result[1].strip_prefix(&base).unwrap();
 
-            // Check that they are the expected files
-            let rel1 = result[0].strip_prefix(&base).unwrap();
-            let rel2 = result[1].strip_prefix(&base).unwrap();
+        assert!(rel1.to_string_lossy().contains("clipboard.rs"));
+        assert!(rel1.to_string_lossy().contains("utilities"));
+        assert!(rel2.to_string_lossy().contains("main.rs"));
 
-            assert!(
-                rel1.to_string_lossy().contains("clipboard.rs"),
-                "First file should be clipboard.rs"
-            );
-            assert!(
-                rel1.to_string_lossy().contains("utilities"),
-                "First file should be in utilities"
-            );
-            assert!(
-                rel2.to_string_lossy().contains("main.rs"),
-                "Second file should be main.rs"
-            );
+        for path in &result {
+            let s = path.to_string_lossy();
+            assert!(!s.contains("monaco"), "Monaco CSS should not appear in results");
+            assert!(!s.contains("focus"), "UI styles should not appear in results");
+        }
 
-            // CSS/UI text should never appear in results
-            for path in &result {
-                let path_str = path.to_string_lossy();
-                assert!(
-                    !path_str.contains("monaco"),
-                    "Monaco CSS should not be in results"
-                );
-                assert!(
-                    !path_str.contains("focus"),
-                    "UI styles should not be in results"
-                );
-            }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // ---------------------------------------------------------------------------
+    // first_successful_reader — production fallback logic
+    // ---------------------------------------------------------------------------
+
+    /// `echo` exists as a real binary on Unix and its output is predictable,
+    /// so we can test the fallback path with real OS commands.
+    #[test]
+    #[cfg(unix)]
+    fn first_successful_reader_skips_missing_then_succeeds() {
+        let result = first_successful_reader(&[
+            ("_no_such_bmo_cmd_", &[]),
+            ("echo", &["clipboard_content"]),
+        ]);
+        assert!(result.is_some(), "Should fall through to echo");
+        assert!(
+            result.unwrap().contains("clipboard_content"),
+            "Should return echo's output"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn first_successful_reader_returns_none_when_all_fail() {
+        let result = first_successful_reader(&[
+            ("_no_such_bmo_cmd_a_", &[]),
+            ("_no_such_bmo_cmd_b_", &[]),
+        ]);
+        assert!(result.is_none(), "Should return None when all commands fail");
+    }
+
+    // ---------------------------------------------------------------------------
+    // read_clipboard_candidates — smoke test of the production reader
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn read_clipboard_candidates_returns_non_empty_strings() {
+        // Exercises the real production function on whatever platform this runs
+        // on. The result may be empty (e.g. in headless CI) but must never
+        // contain empty strings — the function is supposed to filter those out.
+        let candidates = read_clipboard_candidates();
+        for s in &candidates {
+            assert!(!s.is_empty(), "Candidates Vec must never contain empty strings");
         }
     }
+
+    // ---------------------------------------------------------------------------
+    // normalize_clipboard_text
+    // ---------------------------------------------------------------------------
 
     #[test]
     fn normalize_clipboard_text_crlf_newlines() {
         let text = "+99\r\n-30\r\n\r\n`main.rs`src\r\n+7\r\n-3";
         let normalized = normalize_clipboard_text(text);
-        // Should convert \r\n to \n
         assert!(!normalized.contains("\r\n"));
-        assert!(normalized.contains("\n"));
-        // Should still parse correctly
+        assert!(normalized.contains('\n'));
         assert!(normalized.contains("`main.rs`src"));
     }
 
     #[test]
     fn normalize_clipboard_text_zero_width_space() {
-        // U+200B (zero-width space) should be removed
         let text = "+106-33`clip\u{200B}board.rs`src/utilities";
         let normalized = normalize_clipboard_text(text);
-        assert!(!normalized.contains("\u{200B}"));
+        assert!(!normalized.contains('\u{200B}'));
         assert!(normalized.contains("clipboard.rs"));
     }
 
     #[test]
     fn normalize_clipboard_text_nbsp() {
-        // U+00A0 (non-breaking space) should become normal space
         let text = "+106-33`clipboard.rs`src/utilities\u{00A0}";
         let normalized = normalize_clipboard_text(text);
         assert!(normalized.contains(' '));
-        assert!(!normalized.contains("\u{00A0}"));
+        assert!(!normalized.contains('\u{00A0}'));
     }
 
     #[test]
     fn normalize_clipboard_text_unicode_line_separators() {
-        // U+2028 (line separator) and U+2029 (paragraph separator) should become \n
         let text = "`clipboard.rs`src/utilities\u{2028}`main.rs`src";
         let normalized = normalize_clipboard_text(text);
         assert_eq!(normalized.matches('\n').count(), 1);
-        assert!(!normalized.contains("\u{2028}"));
+        assert!(!normalized.contains('\u{2028}'));
     }
 
     #[test]
     fn normalize_clipboard_text_typographic_backticks() {
-        // Typographic backticks ' ' should become ASCII `
         let text = "file.rs with \u{2018}quoted\u{2019} text";
         let normalized = normalize_clipboard_text(text);
         assert_eq!(normalized.matches('`').count(), 2);
-        assert!(!normalized.contains("\u{2018}"));
-        assert!(!normalized.contains("\u{2019}"));
+        assert!(!normalized.contains('\u{2018}'));
+        assert!(!normalized.contains('\u{2019}'));
     }
 
     #[test]
     fn extract_clipboard_paths_survives_mixed_unicode_artifacts() {
-        // Test that normalization happens before parsing
-        let base = PathBuf::from(".");
-        if base.join("src/utilities/clipboard.rs").exists() && base.join("src/main.rs").exists() {
-            // Content with CRLF, zero-width spaces, NBSP, and typographic backticks
-            let clipboard =
-                "+106-33`clipboard.rs`src/utilities\r\n+99\r\n-30\r\n\r\n`main.rs`src\u{00A0}";
-            let result = extract_clipboard_paths(&base, clipboard);
+        let base = std::env::temp_dir().join("bmo_test_unicode_artifacts");
+        make_temp_file(&base, "src/utilities/clipboard.rs");
+        make_temp_file(&base, "src/main.rs");
 
-            // Should extract both files despite the Unicode artifacts
-            assert_eq!(
-                result.len(),
-                2,
-                "Should find both files despite Unicode artifacts"
-            );
+        let clipboard =
+            "+106-33`clipboard.rs`src/utilities\r\n+99\r\n-30\r\n\r\n`main.rs`src\u{00A0}";
+        let result = extract_clipboard_paths(&base, clipboard);
+        assert_eq!(result.len(), 2, "Should find both files despite Unicode artifacts");
 
-            let rel0 = result[0].strip_prefix(&base).unwrap().to_string_lossy();
-            let rel1 = result[1].strip_prefix(&base).unwrap().to_string_lossy();
+        let rel0 = result[0].strip_prefix(&base).unwrap().to_string_lossy();
+        let rel1 = result[1].strip_prefix(&base).unwrap().to_string_lossy();
+        assert!(rel0.contains("clipboard.rs"));
+        assert!(rel1.contains("main.rs"));
 
-            assert!(rel0.contains("clipboard.rs"));
-            assert!(rel1.contains("main.rs"));
-        }
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
     fn regression_copilot_css_vs_breadcrumbs() {
-        // REGRESSION TEST for the discovered bug:
-        // Copilot clipboard can contain multiple representations.
-        // First representation: Monaco CSS (0 valid project files)
-        // Second representation: Valid breadcrumbs (2 valid project files)
-        //
-        // BMO must parse both and choose the second because it has more valid files.
-        // The bug was that BMO stopped at the first "successful" command output,
-        // even if it contained only CSS noise.
+        let base = std::env::temp_dir().join("bmo_test_css_vs_breadcrumbs");
+        make_temp_file(&base, "src/utilities/clipboard.rs");
+        make_temp_file(&base, "src/main.rs");
 
-        let base = PathBuf::from(".");
-        if base.join("src/utilities/clipboard.rs").exists() && base.join("src/main.rs").exists() {
-            // First representation: pure Monaco CSS (appears when copying directly from Copilot)
-            let css_repr = ".monaco-list.list_id_186:focus .monaco-list-row.focused {
-    background-color: red;
-}";
-            let css_files = extract_clipboard_paths(&base, css_repr);
-            assert_eq!(
-                css_files.len(),
-                0,
-                "CSS representation should produce 0 valid files"
-            );
+        let css_repr = ".monaco-list.list_id_186:focus .monaco-list-row.focused {\n    background-color: red;\n}";
+        let css_files = extract_clipboard_paths(&base, css_repr);
+        assert_eq!(css_files.len(), 0, "CSS representation should produce 0 valid files");
 
-            // Second representation: valid Copilot breadcrumbs (appears in other clipboard flavors)
-            let breadcrumbs_repr =
-                "+157-11\n`clipboard.rs`src/utilities\n+122\n-7\n`main.rs`src\n+35\n-4";
-            let breadcrumbs_files = extract_clipboard_paths(&base, breadcrumbs_repr);
-            assert_eq!(
-                breadcrumbs_files.len(),
-                2,
-                "Breadcrumb representation should produce 2 valid files"
-            );
+        let breadcrumbs_repr =
+            "+157-11\n`clipboard.rs`src/utilities\n+122\n-7\n`main.rs`src\n+35\n-4";
+        let breadcrumbs_files = extract_clipboard_paths(&base, breadcrumbs_repr);
+        assert_eq!(breadcrumbs_files.len(), 2, "Breadcrumb representation should produce 2 valid files");
 
-            // The key: if BMO had chosen CSS (first), it would fail with no files.
-            // The bug was treating "command succeeded" as "representation is useful".
-            // The fix is to parse both and choose the one with most files.
-            assert!(
-                breadcrumbs_files.len() > css_files.len(),
-                "Breadcrumb representation should win over CSS representation"
-            );
-        }
+        assert!(
+            breadcrumbs_files.len() > css_files.len(),
+            "Breadcrumb representation should win over CSS representation"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

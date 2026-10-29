@@ -9,7 +9,7 @@ PREFIX ?= $(HOME)/.local/bin
 ARCH        := $(shell uname -m)
 MUSL_TARGET := $(ARCH)-unknown-linux-musl
 
-.PHONY: help run build release check fmt lint clean install docker-build docker-run docker-install docker-extract
+.PHONY: help run build release check fmt lint clean install docker-build docker-run docker-install docker-extract package
 
 # Default target: list what is available.
 help:
@@ -25,7 +25,7 @@ help:
 	@echo "  make docker-build    Build the Docker image ($(IMAGE))"
 	@echo "  make docker-run      Run the image against the current directory"
 	@echo "  make docker-install  Install a '$(BIN)' wrapper that runs the image (no Rust; no clipboard)"
-	@echo "  make docker-extract  Build a native binary in Docker and install it (no Rust; Linux only)"
+	@echo "  make package         Create a clean source archive (bmo_cli.tar.gz, no target/ or secrets)"
 
 # The binary copies its output to the clipboard automatically.
 run:
@@ -51,6 +51,12 @@ install:
 
 clean:
 	cargo clean
+
+# Create a clean source archive from committed files only.
+# Uses git archive so target/, .env files, and macOS metadata are never included.
+package:
+	git archive HEAD --prefix=bmo_cli/ | gzip > bmo_cli.tar.gz
+	@echo "Created bmo_cli.tar.gz (committed files only — no target/, .env, or macOS metadata)."
 
 docker-build:
 	docker build -t $(IMAGE) .
